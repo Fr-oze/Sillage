@@ -17,6 +17,9 @@ enum WindowGeometry {
     @MainActor private(set) static var dockIsEstimated = false
     @MainActor private(set) static var fullscreenFrames: [CGRect] = []
 
+    @MainActor private(set) static var particleOccluders: [CGRect] = []
+    @MainActor private(set) static var fullscreenForeground: [(frame: CGRect, ids: Set<CGWindowID>)] = []
+
     static func isFullscreen(_ frame: CGRect, screen: CGRect) -> Bool {
         // Une fenêtre maximisée sous la barre de menus n'est pas un plein écran.
         abs(frame.minX - screen.minX) <= 2 && abs(frame.maxX - screen.maxX) <= 2
@@ -65,12 +68,14 @@ enum WindowGeometry {
 
     @MainActor
     static func visibleLedges(windows: Bool, dock: Bool) -> [SnowLedge] {
-        guard windows || dock,
-              let firstScreen = NSScreen.screens.first,
+        particleOccluders = []
+        fullscreenForeground = []
+        fullscreenFrames = []
+        guard let firstScreen = NSScreen.screens.first,
               let entries = CGWindowListCopyWindowInfo(windowListOptions, kCGNullWindowID) as? [[String: Any]] else { return [] }
         dockIsEstimated = false
-        fullscreenFrames = []
-        var frontOwners: [Int: pid_t] = [:]
+        let screens = NSScreen.screens
+        var foregroundIDs: [Int: Set<CGWindowID>] = [:]
         let primaryTop = firstScreen.frame.maxY
         let dockPID = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier
         var occluders: [CGRect] = []
@@ -90,7 +95,7 @@ enum WindowGeometry {
                   let id = entry[kCGWindowNumber as String] as? UInt32 else { continue }
             let frame = appKitRect(cgRect, primaryTop: primaryTop)
             let pid = entry[kCGWindowOwnerPID as String] as? pid_t
-            // Les vitres de Neige sont au niveau statusBar, pas ses réglages (niveau 0).
+            // Les vitres de Sillage sont au-dessus des fenêtres ordinaires, pas ses réglages (niveau 0).
             if pid == ProcessInfo.processInfo.processIdentifier && layer != 0 { continue }
             guard NSScreen.screens.contains(where: { $0.frame.intersects(frame) }) else { continue }
             let isDock = pid == dockPID && layer != 0 && frame.width > frame.height * 2 && frame.height >= 20 && frame.height <= 180
@@ -101,21 +106,22 @@ enum WindowGeometry {
                 eligibleOwners[ownerPID] = ownerPID == ProcessInfo.processInfo.processIdentifier
                     || (app != nil && app!.activationPolicy != .prohibited)
             }
-            if layer == 0 && eligibleOwners[ownerPID] == true && ownerPID != ProcessInfo.processInfo.processIdentifier && frame.width >= 160 && frame.height >= 80 {
-                for (index, screen) in NSScreen.screens.enumerated() where frame.intersects(screen.frame) {
-                    let usable = screen.visibleFrame
-                    let overlap = frame.intersection(usable)
-                    let covers = overlap.width >= usable.width * 0.98 && overlap.height >= usable.height * 0.98
-                    if hasVisibleTop(frame, screenFrames: [usable]) || covers {
-                        if frontOwners[index] == nil && isFullscreen(frame, screen: screen.frame) && !fullscreenFrames.contains(screen.frame) { fullscreenFrames.append(screen.frame) }
-                        if frontOwners[index] == nil { frontOwners[index] = ownerPID }
+            let appWindow = eligibleOwners[ownerPID] == true && (layer == 0 || layer == Int(CGWindowLevelForKey(.floatingWindow)))
+            if appWindow {
+                for (index, screen) in screens.enumerated() where frame.intersects(screen.frame) && !fullscreenFrames.contains(screen.frame) {
+                    if layer == 0 && ownerPID != ProcessInfo.processInfo.processIdentifier && isFullscreen(frame, screen: screen.frame) {
+                        fullscreenFrames.append(screen.frame)
+                        fullscreenForeground.append((screen.frame, foregroundIDs[index, default: []]))
+                    } else {
+                        foregroundIDs[index, default: []].insert(id)
+                        particleOccluders.append(frame.intersection(screen.frame))
                     }
                 }
             }
             // Les fenêtres auxiliaires de rendu (boutons, effets système, snapshots)
             // ne constituent pas un appui, même lorsqu'elles ont la couche zéro.
             let headroom = headroom(above: frame, visibleFrames: NSScreen.screens.map(\.visibleFrame))
-            let normalSupport = layer == 0 && eligibleOwners[ownerPID] == true
+            let normalSupport = appWindow
                 && frame.width >= 160 && frame.height >= 80 && headroom > 2
             let candidate = (windows && normalSupport) || (dock && isDock)
             // macOS récent : le Dock peut n'exposer que son conteneur plein écran.
@@ -130,7 +136,7 @@ enum WindowGeometry {
                 // être confondu avec une fermeture et déclencher une avalanche.
                 ledges.append(SnowLedge(id: id, frame: frame, spans: spans, isDock: isDock, ownerPID: ownerPID, maxSnowHeight: min(20, headroom)))
             }
-            let normalCover = layer == 0 && frame.width >= 160 && frame.height >= 80
+            let normalCover = (layer == 0 || appWindow) && frame.width >= 160 && frame.height >= 80
                 && (hasVisibleTop(frame, screenFrames: NSScreen.screens.map(\.visibleFrame))
                     || NSScreen.screens.contains { screen in
                         let overlap = frame.intersection(screen.visibleFrame)

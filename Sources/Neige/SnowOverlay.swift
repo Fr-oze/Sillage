@@ -13,6 +13,39 @@ final class SnowScene: SKScene {
     private var season = Season.winter
     private var texture: SKTexture?
     private var trackingFast = false
+    private let backgroundLayer = SKCropNode()
+    private var lastOccluders: [CGRect]?
+
+    func updateOcclusion(_ occluders: [CGRect], screenFrame: CGRect) {
+        let local = occluders.map { $0.intersection(screenFrame) }.filter { !$0.isNull && !$0.isEmpty }
+            .map { $0.offsetBy(dx: -screenFrame.minX, dy: -screenFrame.minY) }
+        guard local != lastOccluders else { return }
+        lastOccluders = local
+        guard !local.isEmpty else { backgroundLayer.maskNode = nil; return }
+        var visible = [CGRect(origin: .zero, size: size)]
+        for cover in local {
+            visible = visible.flatMap { rect -> [CGRect] in
+                let cut = rect.intersection(cover)
+                guard !cut.isNull && !cut.isEmpty else { return [rect] }
+                return [
+                    CGRect(x: rect.minX, y: rect.minY, width: cut.minX - rect.minX, height: rect.height),
+                    CGRect(x: cut.maxX, y: rect.minY, width: rect.maxX - cut.maxX, height: rect.height),
+                    CGRect(x: cut.minX, y: rect.minY, width: cut.width, height: cut.minY - rect.minY),
+                    CGRect(x: cut.minX, y: cut.maxY, width: cut.width, height: rect.maxY - cut.maxY)
+                ].filter { !$0.isEmpty }
+            }
+        }
+        let mask = SKNode()
+        // Keep an alpha-zero pixel even when no desktop is exposed.
+        mask.addChild(SKSpriteNode(color: .clear, size: CGSize(width: 1, height: 1)))
+        for rect in visible {
+            let tile = SKSpriteNode(color: .white, size: rect.size)
+            tile.anchorPoint = .zero
+            tile.position = rect.origin
+            mask.addChild(tile)
+        }
+        backgroundLayer.maskNode = mask
+    }
 
     func setTrackingFast(_ fast: Bool) {
         trackingFast = fast
@@ -40,6 +73,7 @@ final class SnowScene: SKScene {
     func sendSnowplow() { deposits.requestPlow(); updateFrameRate() }
 
     func apply(_ settings: Settings) {
+        deposits.backgroundLayer = backgroundLayer
         deposits.configure(enabled: !settings.behindWindows, automaticPlow: settings.automaticPlow, scene: self, followWindows: true, hangDelay: settings.cartoonPause ? SnowSurfaceMath.hangTime : 0)
         if season != settings.season || texture == nil {
             season = settings.season
@@ -69,6 +103,8 @@ final class SnowScene: SKScene {
     override func didMove(to view: SKView) {
         guard flakes.isEmpty else { return }
         backgroundColor = .clear
+        addChild(backgroundLayer)
+        deposits.backgroundLayer = backgroundLayer
         let texture = season.particleTexture()
         // Un plafond global réparti entre les écrans, sans moteur physique.
         let count = max(12, 220 / max(1, NSScreen.screens.count))
@@ -77,7 +113,7 @@ final class SnowScene: SKScene {
             let node = SKSpriteNode(texture: texture, size: CGSize(width: side, height: side))
             node.position = CGPoint(x: .random(in: 0...size.width), y: .random(in: 0...size.height))
             node.alpha = .random(in: 0.35...0.85)
-            addChild(node)
+            backgroundLayer.addChild(node)
             flakeVolumes.append(max(0.3, side * 0.6))
             flakes.append((node, .random(in: 25...65), .random(in: -7...12)))
         }
@@ -156,7 +192,7 @@ final class SnowOverlay: NSObject {
             window.isOpaque = false
             window.hasShadow = false
             window.ignoresMouseEvents = true
-            window.level = .statusBar
+            window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) - 1)
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
             window.hidesOnDeactivate = false
             let view = SKView(frame: NSRect(origin: .zero, size: screen.frame.size))
@@ -176,9 +212,9 @@ final class SnowOverlay: NSObject {
 
     func apply(_ settings: Settings) {
         self.settings = settings
-        let desktopLevel = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) + 1)
-        for window in windows { window.level = settings.behindWindows ? desktopLevel : .statusBar }
         for view in views { (view.scene as? SnowScene)?.apply(settings) }
+        polling.requestFast(at: ProcessInfo.processInfo.systemUptime)
+        sampleWindows()
     }
 
     func sendSnowplow() {
@@ -198,7 +234,7 @@ final class SnowOverlay: NSObject {
     }
 
     private func configureTimer() {
-        let shouldRun = isActive && settings.map { !$0.behindWindows && ($0.accumulateWindows || $0.accumulateDock) } == true
+        let shouldRun = isActive && settings != nil
         if shouldRun && timer == nil {
             let timer = Timer(timeInterval: 1.0 / 30.0, target: self, selector: #selector(sampleWindows), userInfo: nil, repeats: true)
             timer.tolerance = 0.001
@@ -229,7 +265,7 @@ final class SnowOverlay: NSObject {
         guard shouldSample else { return }
         let interval = lastSample == 0 ? 0 : min(1, now - lastSample)
         lastSample = now
-        let ledges = WindowGeometry.visibleLedges(windows: settings.accumulateWindows, dock: settings.accumulateDock)
+        let ledges = WindowGeometry.visibleLedges(windows: !settings.behindWindows && settings.accumulateWindows, dock: !settings.behindWindows && settings.accumulateDock)
         if settings.dockEstimated != WindowGeometry.dockIsEstimated {
             settings.dockEstimated = WindowGeometry.dockIsEstimated
         }
@@ -240,7 +276,12 @@ final class SnowOverlay: NSObject {
 
     private func updateScenes(_ ledges: [SnowLedge], amount: Double, interval: TimeInterval = 0) {
         for (index, view) in views.enumerated() {
-            (view.scene as? SnowScene)?.updateLedges(ledges, screenFrame: screenFrames[index], amount: amount, interval: interval, fullscreen: WindowGeometry.fullscreenFrames.contains(screenFrames[index]))
+            guard let scene = view.scene as? SnowScene else { continue }
+            let frame = screenFrames[index]
+            let foreground = WindowGeometry.fullscreenForeground.first { $0.frame == frame }?.ids
+            let supports = foreground.map { ids in ledges.filter { ids.contains($0.id) || $0.isDock } } ?? ledges
+            scene.updateOcclusion(WindowGeometry.particleOccluders, screenFrame: frame)
+            scene.updateLedges(supports, screenFrame: frame, amount: amount, interval: interval, fullscreen: foreground != nil && supports.isEmpty)
         }
     }
 

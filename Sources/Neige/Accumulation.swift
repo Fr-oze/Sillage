@@ -53,6 +53,7 @@ final class SnowDeposits {
     private var lastClock: TimeInterval?
     private var simulationTime: TimeInterval = 0
     private var ground: GroundSnow?
+    weak var backgroundLayer: SKNode?
     private let groundNode = SKShapeNode()
     private var groundDirty = false
     private var groundDrawTime: CGFloat = 0
@@ -96,7 +97,7 @@ final class SnowDeposits {
             groundNode.fillColor = season.depositColor
             groundNode.strokeColor = .clear
             groundNode.zPosition = 3
-            scene.addChild(groundNode)
+            (backgroundLayer ?? scene).addChild(groundNode)
         }
         groundNode.isHidden = !enabled
     }
@@ -533,7 +534,7 @@ final class SnowDeposits {
         pile.fillColor = season.depositColor
         pile.strokeColor = .clear
         root.addChild(pile)
-        scene.addChild(root)
+        (backgroundLayer ?? scene).addChild(root)
         plow = root
         plowPile = pile
         sweptUntil = -100
